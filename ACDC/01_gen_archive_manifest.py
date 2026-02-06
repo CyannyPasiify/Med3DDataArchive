@@ -1,0 +1,446 @@
+# -*- coding: utf-8 -*-
+"""
+Data Archive Manifest Generator for ACDC Dataset
+
+This script generates a comprehensive manifest Excel file for the ACDC (Automated Cardiac 
+Diagnosis Challenge) dataset, extracting metadata from NIfTI image files including dimensions,
+spacings, orientations, and transformation matrices.
+
+Parameters:
+    -r, --root_dir: Root directory of the dataset containing 'training' and 'testing' subdirectories
+    -o, --output_manifest_file: Output path for the generated Excel manifest file
+    -s, --sheet_name: Optional sheet name for the Excel worksheet
+
+Usage Examples:
+    python 01_gen_archive_manifest.py -r /path/to/ACDC -o /path/to/archive_manifest.xlsx
+    python 01_gen_archive_manifest.py --root_dir /path/to/ACDC --output_manifest_file /path/to/archive_manifest.xlsx --sheet_name Manifest
+"""
+
+import re
+import argparse
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from tqdm import tqdm
+from monai.transforms import LoadImage
+
+
+def parse_args():
+    """
+    Parse command line arguments using argparse.
+    
+    Returns:
+        argparse.Namespace: Parsed arguments containing root_dir, output_manifest_file, and sheet_name
+    """
+    parser = argparse.ArgumentParser(
+        description='Generate data archive manifest for ACDC dataset',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s -r /path/to/ACDC -o /path/to/archive_manifest.xlsx
+  %(prog)s --root_dir /path/to/ACDC --output_manifest_file /path/to/archive_manifest.xlsx --sheet_name ACDC_Manifest
+        """
+    )
+    
+    parser.add_argument(
+        '-r', '--root_dir',
+        type=str,
+        required=True,
+        help='Root directory of the dataset containing training and testing subdirectories'
+    )
+    
+    parser.add_argument(
+        '-o', '--output_manifest_file',
+        type=str,
+        required=True,
+        help='Output path for the generated Excel manifest file'
+    )
+    
+    parser.add_argument(
+        '-s', '--sheet_name',
+        type=str,
+        default='Manifest',
+        help='Optional sheet name for the Excel worksheet (default: Manifest)'
+    )
+    
+    return parser.parse_args()
+
+
+def is_diagonal_matrix(matrix, tol=0.0):
+    """
+    Check if a matrix is diagonal (all off-diagonal elements are close to zero).
+    
+    Args:
+        matrix (np.ndarray): Input matrix to check
+        tol (float): Tolerance for considering an element as zero
+        
+    Returns:
+        bool: True if matrix is diagonal, False otherwise
+    """
+    if matrix.shape[0] != matrix.shape[1]:
+        return False
+    
+    mask = ~np.eye(matrix.shape[0], dtype=bool)
+    return np.allclose(matrix[mask], 0, atol=tol)
+
+
+def get_orientation_string(affine):
+    """
+    Extract orientation string from affine matrix.
+    
+    Args:
+        affine (np.ndarray): 4x4 affine transformation matrix
+        
+    Returns:
+        tuple: (orientation_from, orientation_to) strings, or ('Oblique', 'Oblique') if non-standard
+    """
+    rotation = affine[:3, :3]
+    
+    if not is_diagonal_matrix(rotation):
+        return 'Oblique', 'Oblique'
+    
+    def get_axis_label(vec):
+        max_idx = np.argmax(np.abs(vec))
+        val = vec[max_idx]
+        
+        if max_idx == 0:
+            return 'R' if val > 0 else 'L'
+        elif max_idx == 1:
+            return 'A' if val > 0 else 'P'
+        else:
+            return 'S' if val > 0 else 'I'
+    
+    orientation_from = ''.join([get_axis_label(-rotation[:, i]) for i in range(3)])
+    orientation_to = ''.join([get_axis_label(rotation[:, i]) for i in range(3)])
+    
+    return orientation_from, orientation_to
+
+
+def get_image_metadata(nii_path):
+    """
+    Extract metadata from a NIfTI image file using MONAI LoadImage.
+    
+    Args:
+        nii_path (str or Path): Path to the NIfTI file
+        
+    Returns:
+        dict: Dictionary containing image metadata including dimensions, spacings, orientation, and transform
+    """
+    loader = LoadImage(image_only=False, dtype=None)
+    img_data, img_meta = loader(str(nii_path))
+    
+    affine = img_meta['affine'].numpy()
+    shape = img_meta['spatial_shape'].tolist()
+    
+    pixdim = img_meta.get('pixdim', None)
+    if pixdim is not None:
+        zooms = [pixdim[i] for i in range(len(pixdim))]
+    else:
+        zooms = [1.0] * len(shape)
+    
+    orientation_from, orientation_to = get_orientation_string(affine)
+    
+    metadata = {
+        'szx': shape[0] if len(shape) > 0 else '',
+        'szy': shape[1] if len(shape) > 1 else '',
+        'szz': shape[2] if len(shape) > 2 else '',
+        'szt': shape[3] if len(shape) > 3 else '',
+        'spx': zooms[1] if len(zooms) > 1 else '',
+        'spy': zooms[2] if len(zooms) > 2 else '',
+        'spz': zooms[3] if len(zooms) > 3 else '',
+        'spt': zooms[4] if len(zooms) > 4 else '',
+        'orientation_from': orientation_from,
+        'orientation_to': orientation_to,
+        'dtype': str(img_data.numpy().dtype),
+        'transform': affine
+    }
+    
+    return metadata
+
+
+def calculate_transform_f_norm_diff(affine1, affine2):
+    """
+    Calculate the Frobenius norm of the difference between two transformation matrices.
+    
+    Args:
+        affine1 (np.ndarray): First 4x4 affine matrix
+        affine2 (np.ndarray): Second 4x4 affine matrix
+        
+    Returns:
+        float: Frobenius norm of the difference matrix
+    """
+    diff = affine1 - affine2
+    f_norm = np.linalg.norm(diff, 'fro')
+    return f_norm
+
+
+def parse_info_cfg(info_cfg_path):
+    """
+    Parse Info.cfg file to extract patient information.
+    
+    Args:
+        info_cfg_path (str or Path): Path to the Info.cfg file
+        
+    Returns:
+        dict: Dictionary containing ED, ES, Group, Height, NbFrame, Weight information
+    """
+    info = {
+        'ED': None,
+        'ES': None,
+        'Group': None,
+        'Height': None,
+        'NbFrame': None,
+        'Weight': None
+    }
+    
+    try:
+        with open(info_cfg_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                
+                if ':' in line:
+                    key, value = line.split(':', 1)
+                    key = key.strip()
+                    value = value.strip()
+                    
+                    if key in info:
+                        if key in ['Height', 'Weight']:
+                            try:
+                                info[key] = float(value)
+                            except ValueError:
+                                pass
+                        elif key in ['ED', 'ES', 'NbFrame']:
+                            try:
+                                info[key] = int(value)
+                            except ValueError:
+                                pass
+                        else:
+                            info[key] = value
+    except Exception as e:
+        pass
+    
+    return info
+
+
+def determine_phase(frame_id, ed, es):
+    """
+    Determine the cardiac phase (ED/ES/UND) based on frame number.
+    
+    Args:
+        frame_id (str): Frame number as string
+        ed (int): End Diastolic frame number
+        es (int): End Systolic frame number
+        
+    Returns:
+        str: 'ED', 'ES', or 'UND' based on frame number
+    """
+    try:
+        frame_num = int(frame_id)
+        if ed is not None and frame_num == ed:
+            return 'ED'
+        elif es is not None and frame_num == es:
+            return 'ES'
+        else:
+            return 'UND'
+    except (ValueError, TypeError):
+        return 'UND'
+
+
+def scan_dataset(root_dir):
+    """
+    Scan the dataset directory structure and collect all relevant image files.
+    
+    Args:
+        root_dir (str or Path): Root directory path containing training and testing subdirectories
+        
+    Returns:
+        list: List of dictionaries containing file information
+    """
+    root_path = Path(root_dir)
+    file_info_list = []
+    
+    subdirs = ['training', 'testing']
+    
+    for subdir in tqdm(subdirs, desc='Processing subsets'):
+        subdir_path = root_path / subdir
+        if not subdir_path.exists():
+            continue
+        
+        patient_dirs = sorted(subdir_path.glob('patient*'))
+        
+        for patient_dir in tqdm(patient_dirs, desc=f'  {subdir} patients', leave=False):
+            patient_match = re.match(r'patient(\d{3})', patient_dir.name)
+            if not patient_match:
+                continue
+            
+            patient_id = patient_match.group(1)
+            
+            info_cfg_path = patient_dir / 'Info.cfg'
+            patient_info = parse_info_cfg(info_cfg_path)
+            
+            nii_files = list(patient_dir.glob('*.nii.gz'))
+            
+            frame_transforms = {}
+            
+            for nii_file in tqdm(nii_files, desc=f'    patient{patient_id}', leave=False):
+                filename = nii_file.name
+                
+                frame_match = re.match(rf'patient{patient_id}_frame(\d{{2}})\.nii\.gz', filename)
+                gt_match = re.match(rf'patient{patient_id}_frame(\d{{2}})_gt\.nii\.gz', filename)
+                
+                if frame_match:
+                    frame_id = frame_match.group(1)
+                    metadata = get_image_metadata(str(nii_file))
+                    frame_transforms[frame_id] = metadata['transform']
+                    
+                    phase = determine_phase(frame_id, patient_info['ED'], patient_info['ES'])
+                    
+                    rel_path = nii_file.relative_to(root_path)
+                    file_info = {
+                        'file_path': str(rel_path.as_posix()),
+                        'subset': subdir,
+                        'patient': patient_id,
+                        'frame': frame_id,
+                        'type': 'v3d',
+                        'phase': phase,
+                        'group': patient_info['Group'],
+                        'tot_frame': patient_info['NbFrame'],
+                        'height': patient_info['Height'],
+                        'weight': patient_info['Weight'],
+                        'szx': metadata['szx'],
+                        'szy': metadata['szy'],
+                        'szz': metadata['szz'],
+                        'spx': metadata['spx'],
+                        'spy': metadata['spy'],
+                        'spz': metadata['spz'],
+                        'orientation_from': metadata['orientation_from'],
+                        'orientation_to': metadata['orientation_to'],
+                        'dtype': metadata['dtype'],
+                        'transform': metadata['transform'],
+                        'diff_trans_f_norm': ''
+                    }
+                    file_info_list.append(file_info)
+                
+                elif gt_match:
+                    frame_id = gt_match.group(1)
+                    metadata = get_image_metadata(str(nii_file))
+                    
+                    diff_f_norm = ''
+                    if frame_id in frame_transforms:
+                        diff_f_norm = calculate_transform_f_norm_diff(
+                            metadata['transform'],
+                            frame_transforms[frame_id]
+                        )
+                    
+                    phase = determine_phase(frame_id, patient_info['ED'], patient_info['ES'])
+                    
+                    rel_path = nii_file.relative_to(root_path)
+                    file_info = {
+                        'file_path': str(rel_path.as_posix()),
+                        'subset': subdir,
+                        'patient': patient_id,
+                        'frame': frame_id,
+                        'type': 'm3d',
+                        'phase': phase,
+                        'group': patient_info['Group'],
+                        'tot_frame': patient_info['NbFrame'],
+                        'height': patient_info['Height'],
+                        'weight': patient_info['Weight'],
+                        'szx': metadata['szx'],
+                        'szy': metadata['szy'],
+                        'szz': metadata['szz'],
+                        'spx': metadata['spx'],
+                        'spy': metadata['spy'],
+                        'spz': metadata['spz'],
+                        'orientation_from': metadata['orientation_from'],
+                        'orientation_to': metadata['orientation_to'],
+                        'dtype': metadata['dtype'],
+                        'transform': metadata['transform'],
+                        'diff_trans_f_norm': diff_f_norm
+                    }
+                    file_info_list.append(file_info)
+    
+    return file_info_list
+
+
+def format_transform_for_excel(transform):
+    """
+    Format 4x4 transformation matrix for Excel output.
+    
+    Args:
+        transform (np.ndarray or str): 4x4 affine transformation matrix or empty string
+        
+    Returns:
+        str: Formatted string representation of the matrix
+    """
+    formatter = {'float_kind': lambda x: f'{x:>14.8f}'}
+    matrix_str = np.array2string(transform, formatter=formatter, separator='')
+    return matrix_str
+
+
+def generate_manifest_excel(file_info_list, output_path, sheet_name='Manifest'):
+    """
+    Generate Excel manifest file from collected file information.
+    
+    Args:
+        file_info_list (list): List of dictionaries containing file metadata
+        output_path (str or Path): Output path for the Excel file
+        sheet_name (str): Name for the Excel worksheet
+    """
+    df_data = []
+    
+    for file_info in tqdm(file_info_list, desc='Generating Excel rows'):
+        row = {
+            'file_path': file_info['file_path'],
+            'subset': file_info['subset'],
+            'patient': file_info['patient'],
+            'frame': file_info['frame'],
+            'type': file_info['type'],
+            'phase': file_info['phase'],
+            'group': file_info['group'],
+            'tot_frame': file_info['tot_frame'],
+            'height': file_info['height'],
+            'weight': file_info['weight'],
+            'szx': file_info['szx'],
+            'szy': file_info['szy'],
+            'szz': file_info['szz'],
+            'spx': file_info['spx'],
+            'spy': file_info['spy'],
+            'spz': file_info['spz'],
+            'orientation_from': file_info['orientation_from'],
+            'orientation_to': file_info['orientation_to'],
+            'dtype': file_info['dtype'],
+            'transform': format_transform_for_excel(file_info['transform']),
+            'diff_trans_f_norm': file_info['diff_trans_f_norm']
+        }
+        df_data.append(row)
+    
+    df = pd.DataFrame(df_data)
+    
+    output_dir = Path(output_path).parent
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    with pd.ExcelWriter(str(output_path), engine='openpyxl') as writer:
+        df.to_excel(writer, sheet_name=sheet_name, index=False)
+
+
+def main():
+    """
+    Main function to orchestrate the manifest generation process.
+    """
+    args = parse_args()
+    
+    print(f"Scanning dataset from: {args.root_dir}")
+    file_info_list = scan_dataset(args.root_dir)
+    print(f"Found {len(file_info_list)} image files")
+    
+    print(f"Generating manifest Excel file: {args.output_manifest_file}")
+    generate_manifest_excel(file_info_list, args.output_manifest_file, args.sheet_name)
+    
+    print("Manifest generation completed successfully!")
+
+
+if __name__ == '__main__':
+    main()
