@@ -31,7 +31,7 @@ This repository contains wrapping pipelines for 3D medical image data archives. 
 
 Detailed script usage instructions for each data archive are provided in their respective corresponding directories (please refer to the <u>links</u> in the first column of the table below).
 
-If you only intend to use the pre-wrapped versions of the data archives (i.e., the already standardized and cleansed data), please refer to the [Downloads](#Wrapped Data Archives Downloads) section.
+If you only intend to use the pre-wrapped versions of the data archives (i.e., the already standardized and cleansed data), please refer to the [Downloads](# Wrapped Data Archives Downloads) section.
 
 | Data Archive                                                 | Object                  | Task                         | Samples | Volume Type       |
 | ------------------------------------------------------------ | ----------------------- | ---------------------------- | ------- | ----------------- |
